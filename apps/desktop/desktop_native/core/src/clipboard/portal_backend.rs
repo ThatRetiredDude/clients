@@ -26,16 +26,29 @@ const TOKEN_FILE: &str = "remote_desktop_portal_token";
 /// Whether the portal-based clipboard fallback should be used when the direct `arboard` access
 /// fails.
 pub(crate) fn should_use_portal() -> bool {
-    match super::arboard_backend::read() {
+    // There is no X11 or Wayland data-control clipboard to connect to at all, for example on
+    // GNOME without Xwayland.
+    let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        return true;
+    };
+
+    match clipboard.get_text() {
         Ok(_) => false,
-        // An empty clipboard, or one holding non-text content, reports `ContentNotAvailable`.
-        // That is a successful read of nothing rather than a broken backend, so it must not
-        // trigger the portal fallback.
-        Err(err) => !matches!(
-            err.downcast_ref::<arboard::Error>(),
-            Some(arboard::Error::ContentNotAvailable)
-        ),
+        Err(err) => !is_clipboard_content_error(&err),
     }
+}
+
+/// Whether a failed text read was caused by what is on the clipboard rather than by the backend.
+/// An empty clipboard reports `ContentNotAvailable`. Non-text content such as an image reports
+/// `ConversionFailure`, or on X11 `Unknown` ("incorrect type received from clipboard"). The
+/// backend works in all of these cases, so they must not trigger the portal fallback.
+fn is_clipboard_content_error(err: &arboard::Error) -> bool {
+    matches!(
+        err,
+        arboard::Error::ContentNotAvailable
+            | arboard::Error::ConversionFailure
+            | arboard::Error::Unknown { .. }
+    )
 }
 
 /// Set the clipboard to `text` via the Clipboard portal over a RemoteDesktop session.
@@ -289,10 +302,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn clipboard_content_errors_do_not_use_portal() {
+        assert!(is_clipboard_content_error(
+            &arboard::Error::ContentNotAvailable
+        ));
+        assert!(is_clipboard_content_error(
+            &arboard::Error::ConversionFailure
+        ));
+        // What arboard reports on X11 when the clipboard holds an image.
+        assert!(is_clipboard_content_error(&arboard::Error::Unknown {
+            description: "incorrect type received from clipboard".to_string(),
+        }));
+    }
+
+    #[test]
+    fn unsupported_clipboard_uses_portal() {
+        assert!(!is_clipboard_content_error(
+            &arboard::Error::ClipboardNotSupported
+        ));
+    }
+
+    #[test]
     fn should_use_portal_reads_env() {
         // Only asserts the function evaluates without panicking; the result depends on the
         // host environment (Flatpak + GNOME).
         let _ = should_use_portal();
+    }
+
+    // Requires an X11 clipboard holding an image, e.g. under Xvfb after
+    // `xclip -selection clipboard -t image/png -i image.png`; run manually with `--ignored`.
+    #[test]
+    #[ignore]
+    fn manual_image_on_x11_clipboard_does_not_use_portal() {
+        assert!(!should_use_portal());
     }
 
     // Requires a live GNOME Wayland portal session; run manually with `--ignored`.
